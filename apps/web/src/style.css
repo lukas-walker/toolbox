@@ -1,0 +1,184 @@
+:root {
+    color-scheme: light;
+    --bg: #fff;
+    --text: #111;
+    --muted: #666;
+    --border: #e5e7eb;
+    --panel: #f8fafc;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    color: var(--text);
+    background: var(--bg);
+}
+
+#app-header {
+    position: sticky;
+    top: 0;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    z-index: 10;
+}
+
+#tool-tabs {
+    display: flex;
+    gap: 8px;
+    padding: 10px;
+    overflow-x: auto;
+}
+
+.tool-tab {
+    border: 1px solid var(--border);
+    background: #fff;
+    padding: 8px 12px;
+    border-radius: 10px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.tool-tab.active {
+    border-color: #111;
+}
+
+#app-main {
+    padding: 14px;
+    max-width: 900px;
+    margin: 0 auto;
+}
+
+.tool h1 {
+    margin: 0 0 6px 0;
+    font-size: 20px;
+}
+
+.tool p {
+    margin: 0 0 12px 0;
+    color: var(--muted);
+}
+
+.panel {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    border-radius: 14px;
+    padding: 12px;
+}
+
+.row {
+    display: flex;
+    gap: 10px;
+    margin-top: 10px;
+    flex-wrap: wrap;
+}
+
+button {
+    border: 1px solid var(--border);
+    background: #fff;
+    padding: 10px 12px;
+    border-radius: 12px;
+    cursor: pointer;
+}
+
+button.primary {
+    border-color: #111;
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.file-list {
+    margin-top: 12px;
+}
+
+.file-list ul {
+    margin: 0;
+    padding-left: 18px;
+}
+
+.status {
+    margin-top: 10px;
+    color: var(--muted);
+}
+
+.muted {
+    color: var(--muted);
+}
+
+
+.dropzone {
+    position: relative;
+    border: 2px dashed var(--border);
+    border-radius: 14px;
+    padding: 18px;
+    background: #fff;
+    cursor: pointer;
+    text-align: center;
+}
+
+.dropzone.dragover {
+    border-color: #111;
+}
+
+.dropzone-title {
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+
+.dropzone-sub {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.dropzone-input {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+}
+
+.file-table {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.file-row {
+    display: flex;
+    gap: 10px;
+    justify-content: space-between;
+    align-items: center;
+    border: 1px solid var(--border);
+    background: #fff;
+    border-radius: 12px;
+    padding: 10px;
+}
+
+.file-meta {
+    min-width: 0;
+}
+
+.file-name {
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 56vw;
+}
+
+.file-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+button.mini {
+    padding: 8px 10px;
+    border-radius: 10px;
+}
