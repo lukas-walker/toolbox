@@ -1,0 +1,91 @@
+# -----------------------------
+# Node / package managers
+# -----------------------------
+node_modules/
+**/node_modules/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Package manager artifacts (optional)
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+
+# -----------------------------
+# Build outputs (Vite, etc.)
+# -----------------------------
+dist/
+**/dist/
+build/
+**/build/
+out/
+**/out/
+coverage/
+**/coverage/
+
+# Vite / bundler caches
+.vite/
+**/.vite/
+.cache/
+**/.cache/
+
+# -----------------------------
+# Env / secrets
+# -----------------------------
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# -----------------------------
+# Logs / temp
+# -----------------------------
+logs/
+*.log
+tmp/
+temp/
+
+# -----------------------------
+# OS / editor cruft
+# -----------------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# JetBrains / IntelliJ / WebStorm / IDEA
+# -----------------------------
+.idea/
+**/.idea/
+*.iml
+*.ipr
+*.iws
+.idea_modules/
+
+# Local history and other plugin files
+.idea/**/workspace.xml
+.idea/**/tasks.xml
+.idea/**/usage.statistics.xml
+.idea/**/dictionaries
+.idea/**/shelf
+.idea/**/aws.xml
+
+# -----------------------------
+# VS Code (optional; keep if your team prefers)
+# -----------------------------
+.vscode/
+**/.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# -----------------------------
+# Docker local overrides (optional)
+# -----------------------------
+docker-compose.override.yml

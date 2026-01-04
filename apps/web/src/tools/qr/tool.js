@@ -80,7 +80,7 @@ export function createQrTool() {
         container.appendChild(root);
 
         // Load QR generator script (global QRCode function)
-        await loadScript("/vendor/qrcode.min.js");
+        await loadScript(`${import.meta.env.BASE_URL}vendor/qrcode.min.js`);
         if (typeof window.QRCode !== "function") {
             throw new Error("QRCode() not found. Check /public/vendor/qrcode.min.js");
         }
