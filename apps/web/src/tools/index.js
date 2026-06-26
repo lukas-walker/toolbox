@@ -3,11 +3,13 @@ import { createPdfSplitTool } from "./pdf-split/tool.js";
 import { createImageToPdfTool } from "./image-to-pdf/tool.js";
 import { createPdfCompressAdvancedTool } from "./pdf-compress-advanced/tool.js";
 import {createQrTool} from "./qr/tool.js";
+import { createDocScannerTool } from "./doc-scanner/tool.js";
 
 export const tools = [
     createPdfCombineTool(),
     createPdfSplitTool(),
     createImageToPdfTool(),
     createPdfCompressAdvancedTool(),
-    createQrTool()
+    createQrTool(),
+    createDocScannerTool()
 ];
