@@ -1,4 +1,11 @@
 import { STATES, canTransition } from "./logic.js";
+import { loadOpenCv, loadJscanify } from "../../shared/loadOpenCv.js";
+
+// Live border detection (sub-issue #7) runs on a small downscaled copy of the
+// video frame for speed, and only a few times per second to keep CPU/battery in
+// check on mid-range phones.
+const DETECT_MAX_SIDE = 480; // longest side of the detection frame, in px
+const DETECT_INTERVAL_MS = 125; // ~8 fps throttle (not every animation frame)
 
 // Scan Document — mobile-first, fully client-side document scanner.
 //
@@ -25,6 +32,23 @@ export function createDocScannerTool() {
     let currentStream = null;
     let videoEl = null;
 
+    // Live border detection (sub-issue #7). The CV stack is lazy-loaded on
+    // entering `scanning`; `cv` is the initialized OpenCV global and `scanner`
+    // a jscanify instance. The throttled loop draws each frame to a small
+    // offscreen canvas, finds the document quad, and paints it on `overlayEl`.
+    let cv = null;
+    let scanner = null;
+    let cvLoadToken = 0; // guards against a stale async load attaching late
+    let overlayEl = null;
+    let overlayCtx = null;
+    let detectCanvas = null; // offscreen, downscaled frame for detection
+    let detectRaf = null; // requestAnimationFrame handle for the detect loop
+    let lastDetectAt = 0;
+    // Latest detected corners, in full-resolution (video-intrinsic) coordinates,
+    // so the capture task (#8) can reuse them at full resolution. null when no
+    // document is currently detected.
+    let lastCorners = null;
+
     // Teardown registry — later tasks push cleanup callbacks here.
     let teardownFns = [];
 
@@ -48,6 +72,7 @@ export function createDocScannerTool() {
         // Leaving the live preview must release the camera immediately (no light
         // left on), per the resource-ownership checklist in #3.
         if (state === STATES.SCANNING && next !== STATES.SCANNING) {
+            stopDetection();
             stopCamera();
         }
         state = next;
@@ -77,6 +102,9 @@ export function createDocScannerTool() {
         <div class="ds-viewport">
           <!-- playsinline + muted are required for iOS Safari inline playback. -->
           <video id="ds-video" class="ds-video" autoplay playsinline muted></video>
+          <!-- Live border-detection overlay, drawn over the video feed. -->
+          <canvas id="ds-overlay" class="ds-overlay"></canvas>
+          <div id="ds-cv-status" class="ds-cv-status" hidden>Loading scanner…</div>
           <div id="ds-cam-msg" class="ds-viewport-placeholder muted" hidden></div>
         </div>
         <div class="row">
@@ -150,6 +178,8 @@ export function createDocScannerTool() {
             () => {
                 const capture = panel && panel.querySelector("#ds-capture");
                 if (capture) capture.disabled = false;
+                // The feed is live — kick off live border detection.
+                startDetection();
             },
             { once: true }
         );
@@ -174,6 +204,196 @@ export function createDocScannerTool() {
 
     function stopTrack(track) {
         try { track.stop(); } catch (e) { /* ignore */ }
+    }
+
+    // --- Live border detection (sub-issue #7) ---------------------------------
+
+    // Lazy-load the CV stack and start the throttled detection loop. Called once
+    // the camera feed is actually playing. Safe to call repeatedly.
+    function startDetection() {
+        if (!panel || state !== STATES.SCANNING) return;
+        overlayEl = panel.querySelector("#ds-overlay");
+        overlayCtx = overlayEl ? overlayEl.getContext("2d") : null;
+        if (!detectCanvas) detectCanvas = document.createElement("canvas");
+
+        const statusEl = panel.querySelector("#ds-cv-status");
+
+        // Already loaded (e.g. re-entered scanning) — just (re)start the loop.
+        if (cv && scanner) {
+            if (statusEl) statusEl.hidden = true;
+            startDetectLoop();
+            return;
+        }
+
+        if (statusEl) {
+            statusEl.hidden = false;
+            statusEl.textContent = "Loading scanner…";
+        }
+
+        // Token guards against an async load resolving after we've left scanning.
+        const token = ++cvLoadToken;
+        // Load sequentially, NOT concurrently: loadOpenCv() must fully resolve
+        // before loadJscanify(). Calling both at once would run the loader's
+        // runtime-ready wait twice before init and only resolve one of them.
+        let readyCv = null;
+        loadOpenCv()
+            .then((c) => {
+                readyCv = c;
+                return loadJscanify();
+            })
+            .then((Jscanify) => {
+                if (token !== cvLoadToken || state !== STATES.SCANNING) return;
+                cv = readyCv;
+                scanner = new Jscanify();
+                const el = panel && panel.querySelector("#ds-cv-status");
+                if (el) el.hidden = true;
+                startDetectLoop();
+            })
+            .catch((err) => {
+                console.error("doc-scanner: failed to load CV stack", err);
+                if (token !== cvLoadToken) return;
+                const el = panel && panel.querySelector("#ds-cv-status");
+                // Detection is a non-blocking aid — capture still works without it.
+                if (el) {
+                    el.hidden = false;
+                    el.textContent = "Live border detection unavailable.";
+                }
+            });
+    }
+
+    function startDetectLoop() {
+        if (detectRaf != null) return; // already running
+        lastDetectAt = 0;
+        detectRaf = requestAnimationFrame(detectTick);
+    }
+
+    function detectTick(now) {
+        // Schedule the next frame first so an exception can't kill the loop.
+        detectRaf = requestAnimationFrame(detectTick);
+
+        if (!cv || !scanner || !videoEl || state !== STATES.SCANNING) return;
+        // Throttle: only run a detection every DETECT_INTERVAL_MS.
+        if (now - lastDetectAt < DETECT_INTERVAL_MS) return;
+        lastDetectAt = now;
+
+        const video = videoEl;
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        if (video.readyState < 2 || !vw || !vh) return;
+
+        // Detect on a downscaled frame for speed (longest side ~DETECT_MAX_SIDE).
+        const scale = Math.min(1, DETECT_MAX_SIDE / Math.max(vw, vh));
+        const dw = Math.max(1, Math.round(vw * scale));
+        const dh = Math.max(1, Math.round(vh * scale));
+        if (detectCanvas.width !== dw) detectCanvas.width = dw;
+        if (detectCanvas.height !== dh) detectCanvas.height = dh;
+        const dctx = detectCanvas.getContext("2d");
+        dctx.drawImage(video, 0, 0, dw, dh);
+
+        let img = null;
+        let contour = null;
+        try {
+            img = cv.imread(detectCanvas);
+            contour = scanner.findPaperContour(img);
+            const corners = contour ? scanner.getCornerPoints(contour) : null;
+            if (corners && hasAllCorners(corners)) {
+                // Map the downscaled corners back to full-resolution video coords
+                // so the capture task can reuse them; keep the latest set around.
+                const inv = 1 / scale;
+                lastCorners = {
+                    topLeftCorner: scalePoint(corners.topLeftCorner, inv),
+                    topRightCorner: scalePoint(corners.topRightCorner, inv),
+                    bottomRightCorner: scalePoint(corners.bottomRightCorner, inv),
+                    bottomLeftCorner: scalePoint(corners.bottomLeftCorner, inv),
+                };
+                drawOverlay(lastCorners, vw, vh);
+            } else {
+                // No document this frame — clear, don't crash.
+                lastCorners = null;
+                clearOverlay();
+            }
+        } catch (e) {
+            console.error("doc-scanner: detection error", e);
+        } finally {
+            // Free WASM-backed Mats every iteration to avoid memory growth.
+            if (contour) { try { contour.delete(); } catch (e) { /* ignore */ } }
+            if (img) { try { img.delete(); } catch (e) { /* ignore */ } }
+        }
+    }
+
+    function hasAllCorners(c) {
+        return !!(c.topLeftCorner && c.topRightCorner && c.bottomRightCorner && c.bottomLeftCorner);
+    }
+
+    function scalePoint(p, factor) {
+        return { x: p.x * factor, y: p.y * factor };
+    }
+
+    // Draw the detected quad onto the overlay, mapping video-intrinsic coords to
+    // display coords. The <video> uses object-fit: contain, so the rendered feed
+    // is letterboxed inside the viewport — mirror that fit here so the quad lines
+    // up across orientation/resize.
+    function drawOverlay(corners, vw, vh) {
+        if (!overlayEl || !overlayCtx) return;
+        const cssW = overlayEl.clientWidth;
+        const cssH = overlayEl.clientHeight;
+        if (!cssW || !cssH) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const bw = Math.round(cssW * dpr);
+        const bh = Math.round(cssH * dpr);
+        if (overlayEl.width !== bw) overlayEl.width = bw;
+        if (overlayEl.height !== bh) overlayEl.height = bh;
+
+        const ctx = overlayCtx;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, cssW, cssH);
+
+        // object-fit: contain mapping from intrinsic → CSS pixels.
+        const fit = Math.min(cssW / vw, cssH / vh);
+        const offX = (cssW - vw * fit) / 2;
+        const offY = (cssH - vh * fit) / 2;
+        const tx = (p) => ({ x: offX + p.x * fit, y: offY + p.y * fit });
+
+        const tl = tx(corners.topLeftCorner);
+        const tr = tx(corners.topRightCorner);
+        const br = tx(corners.bottomRightCorner);
+        const bl = tx(corners.bottomLeftCorner);
+
+        ctx.beginPath();
+        ctx.moveTo(tl.x, tl.y);
+        ctx.lineTo(tr.x, tr.y);
+        ctx.lineTo(br.x, br.y);
+        ctx.lineTo(bl.x, bl.y);
+        ctx.closePath();
+        ctx.fillStyle = "rgba(34, 197, 94, 0.15)";
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.lineJoin = "round";
+        ctx.strokeStyle = "rgba(34, 197, 94, 0.95)";
+        ctx.stroke();
+    }
+
+    function clearOverlay() {
+        if (!overlayEl || !overlayCtx) return;
+        const dpr = window.devicePixelRatio || 1;
+        overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        overlayCtx.clearRect(0, 0, overlayEl.clientWidth, overlayEl.clientHeight);
+    }
+
+    // Stop the detection loop and release its DOM refs. CV Mats are freed each
+    // iteration, and the loaded `cv`/`scanner` are cached (idempotent loader) so
+    // re-entering scanning doesn't reload the WASM. Invalidate any in-flight load.
+    function stopDetection() {
+        cvLoadToken++;
+        if (detectRaf != null) {
+            cancelAnimationFrame(detectRaf);
+            detectRaf = null;
+        }
+        clearOverlay();
+        overlayEl = null;
+        overlayCtx = null;
+        lastCorners = null;
     }
 
     // Map a getUserMedia rejection onto a clear, actionable message.
@@ -325,9 +545,11 @@ export function createDocScannerTool() {
         state = STATES.IDLE;
         pages = [];
 
-        // Guarantee the camera is released on unmount, regardless of which state
-        // we tear down from.
+        // Guarantee the detection loop and camera are released on unmount,
+        // regardless of which state we tear down from. Registered camera-first so
+        // it runs last (teardown unwinds in reverse), i.e. loop stops first.
         registerTeardown(stopCamera);
+        registerTeardown(stopDetection);
 
         renderState();
 
