@@ -1,4 +1,4 @@
-import { STATES, canTransition } from "./logic.js";
+import { STATES, canTransition, quadOutputSize, fullFrameCorners } from "./logic.js";
 
 // Live border detection (sub-issue #7) runs on a small downscaled copy of the
 // video frame for speed, and only a few times per second to keep CPU/battery in
@@ -8,6 +8,9 @@ import { STATES, canTransition } from "./logic.js";
 // the whole page. The worker keeps the UI responsive while it loads and detects.
 const DETECT_MAX_SIDE = 480; // longest side of the detection frame, in px
 const DETECT_INTERVAL_MS = 125; // ~8 fps throttle (not every animation frame)
+// Cap the longest side of a captured/warped page (sub-issue #8). Keeps documents
+// sharp without producing needlessly huge images to compress and embed in the PDF.
+const CAPTURE_MAX_SIDE = 2000;
 
 // Same-origin, precached worker + vendored CV scripts (absolute so the worker's
 // importScripts resolves them regardless of base path). NEVER load from a CDN.
@@ -60,6 +63,16 @@ export function createDocScannerTool() {
     // so the capture task (#8) can reuse them at full resolution. null when no
     // document is currently detected.
     let lastCorners = null;
+
+    // Capture + warp (sub-issue #8). On Capture we grab a full-resolution frame,
+    // reuse the latest live-detected corners, and hand both to the worker for a
+    // perspective warp. `capturedCanvas` holds the deskewed page awaiting
+    // Accept/Retake in the `review` state. `captureJob` carries the original
+    // frame as a fallback if the warp fails; `captureToken` invalidates stale
+    // async results (a retake or unmount that lands after the warp comes back).
+    let capturedCanvas = null;
+    let captureJob = null;
+    let captureToken = 0;
 
     // Teardown registry — later tasks push cleanup callbacks here.
     let teardownFns = [];
@@ -128,8 +141,7 @@ export function createDocScannerTool() {
         </div>
       </div>
     `;
-        // Placeholder capture: real frame grab + warp arrives in a later task.
-        panel.querySelector("#ds-capture").addEventListener("click", () => setState(STATES.REVIEW));
+        panel.querySelector("#ds-capture").addEventListener("click", onCaptureClick);
         panel.querySelector("#ds-back").addEventListener("click", () =>
             setState(pages.length ? STATES.PAGES : STATES.IDLE)
         );
@@ -277,6 +289,8 @@ export function createDocScannerTool() {
         } else if (msg.type === "result") {
             workerBusy = false;
             handleResult(msg);
+        } else if (msg.type === "warpResult") {
+            handleWarpResult(msg);
         }
     }
 
@@ -365,6 +379,118 @@ export function createDocScannerTool() {
 
     function scalePoint(p, factor) {
         return { x: p.x * factor, y: p.y * factor };
+    }
+
+    // --- Capture + perspective warp (sub-issue #8) ----------------------------
+
+    // Grab the current frame at full camera resolution and warp it to a flat,
+    // cropped page. The heavy OpenCV warp runs in the worker (cv only lives
+    // there), so this stays async: we transition to `review` once the warped
+    // result comes back. If detection never found a document, or the CV worker
+    // is unavailable, we fall back to the full (unwarped) frame instead of
+    // failing.
+    function onCaptureClick() {
+        if (state !== STATES.SCANNING || !videoEl) return;
+        const video = videoEl;
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        if (video.readyState < 2 || !vw || !vh) return;
+
+        // Guard against a double press / navigation while the warp is in flight.
+        const captureBtn = panel && panel.querySelector("#ds-capture");
+        const backBtn = panel && panel.querySelector("#ds-back");
+        if (captureBtn) { captureBtn.disabled = true; captureBtn.textContent = "Processing…"; }
+        if (backBtn) backBtn.disabled = true;
+
+        // Full-resolution frame grab.
+        const frame = document.createElement("canvas");
+        frame.width = vw;
+        frame.height = vh;
+        const fctx = frame.getContext("2d", { willReadFrequently: true });
+        fctx.drawImage(video, 0, 0, vw, vh);
+
+        // Reuse the latest live-detected corners (already mapped to full-res). When
+        // none were found, fall back to the whole frame — warping that quad is just
+        // a resize, giving one uniform code path.
+        const corners = lastCorners || fullFrameCorners(vw, vh);
+
+        // Stop posting detection frames so the worker is free to warp promptly.
+        if (detectRaf != null) { cancelAnimationFrame(detectRaf); detectRaf = null; }
+
+        const token = ++captureToken;
+        captureJob = { token, frame };
+
+        // No CV worker (load failed) → cannot warp; use the plain resized frame.
+        if (!workerReady || !scanWorker) {
+            finishCapture(token, downscaledCanvas(frame, CAPTURE_MAX_SIDE));
+            return;
+        }
+
+        let imageData;
+        try {
+            imageData = fctx.getImageData(0, 0, vw, vh);
+        } catch (err) {
+            // Tainted canvas shouldn't happen with the same-origin camera, but if
+            // it does, degrade gracefully to the unwarped frame.
+            finishCapture(token, downscaledCanvas(frame, CAPTURE_MAX_SIDE));
+            return;
+        }
+
+        const { width: outW, height: outH } = quadOutputSize(corners, CAPTURE_MAX_SIDE);
+        const buffer = imageData.data.buffer;
+        scanWorker.postMessage(
+            {
+                type: "warp",
+                jobId: token,
+                width: vw,
+                height: vh,
+                buffer,
+                corners,
+                outWidth: outW,
+                outHeight: outH,
+            },
+            [buffer] // transfer the pixel buffer to avoid a copy
+        );
+    }
+
+    function handleWarpResult(msg) {
+        const job = captureJob;
+        // Ignore stale results (a newer capture, retake, or unmount happened).
+        if (!job || job.token !== msg.jobId) return;
+        captureJob = null;
+
+        if (msg.ok && msg.buffer && msg.width && msg.height) {
+            const canvas = document.createElement("canvas");
+            canvas.width = msg.width;
+            canvas.height = msg.height;
+            const imageData = new ImageData(new Uint8ClampedArray(msg.buffer), msg.width, msg.height);
+            canvas.getContext("2d").putImageData(imageData, 0, 0);
+            finishCapture(job.token, canvas);
+        } else {
+            // Warp failed in the worker — fall back to the unwarped frame.
+            console.error("doc-scanner: warp failed", msg.error);
+            finishCapture(job.token, downscaledCanvas(job.frame, CAPTURE_MAX_SIDE));
+        }
+    }
+
+    function finishCapture(token, canvas) {
+        // A newer capture or teardown landed while we were processing.
+        if (token !== captureToken || !root || state !== STATES.SCANNING) return;
+        capturedCanvas = canvas;
+        setState(STATES.REVIEW);
+    }
+
+    // Draw a source canvas onto a new one, scaled so its longest side is at most
+    // `maxSide`. Used for the no-warp fallbacks.
+    function downscaledCanvas(src, maxSide) {
+        const sw = src.width;
+        const sh = src.height;
+        const scale = Math.min(1, maxSide / Math.max(sw, sh));
+        const out = document.createElement("canvas");
+        out.width = Math.max(1, Math.round(sw * scale));
+        out.height = Math.max(1, Math.round(sh * scale));
+        out.getContext("2d").drawImage(src, 0, 0, out.width, out.height);
+        return out;
     }
 
     // Draw the detected quad onto the overlay, mapping video-intrinsic coords to
@@ -506,21 +632,32 @@ export function createDocScannerTool() {
     function renderReview() {
         panel.innerHTML = `
       <div class="panel">
-        <div class="ds-viewport">
-          <div class="ds-viewport-placeholder muted">Captured page preview (coming soon)</div>
-        </div>
+        <div class="ds-viewport" id="ds-review-viewport"></div>
         <div class="row">
           <button id="ds-accept" class="primary">Accept</button>
           <button id="ds-retake">Retake</button>
         </div>
       </div>
     `;
+        const viewport = panel.querySelector("#ds-review-viewport");
+        if (capturedCanvas) {
+            capturedCanvas.className = "ds-review-img";
+            viewport.appendChild(capturedCanvas);
+        } else {
+            viewport.innerHTML = `<div class="ds-viewport-placeholder muted">No preview available.</div>`;
+        }
+
         panel.querySelector("#ds-accept").addEventListener("click", () => {
-            // Placeholder page; later tasks store the warped+compressed image here.
-            pages.push({ id: Date.now() + Math.random() });
+            // Hand the warped page (a canvas) off to the page list. Compression
+            // into a blob + thumbnail happens in sub-issue #9.
+            pages.push({ id: Date.now() + Math.random(), canvas: capturedCanvas });
+            capturedCanvas = null; // ownership transferred to the page
             setState(STATES.PAGES);
         });
-        panel.querySelector("#ds-retake").addEventListener("click", () => setState(STATES.SCANNING));
+        panel.querySelector("#ds-retake").addEventListener("click", () => {
+            capturedCanvas = null; // discard; back to live scanning
+            setState(STATES.SCANNING);
+        });
     }
 
     function renderPages() {
@@ -592,6 +729,8 @@ export function createDocScannerTool() {
         panel = root.querySelector("#ds-panel");
         state = STATES.IDLE;
         pages = [];
+        capturedCanvas = null;
+        captureJob = null;
 
         // Guarantee the detection loop, CV worker and camera are all released on
         // unmount, regardless of which state we tear down from. Teardown unwinds
@@ -607,6 +746,10 @@ export function createDocScannerTool() {
 
     function destroy() {
         runTeardown();
+        // Invalidate any in-flight warp and drop the captured page.
+        captureToken++;
+        captureJob = null;
+        capturedCanvas = null;
         pages = [];
         state = STATES.IDLE;
         panel = null;
