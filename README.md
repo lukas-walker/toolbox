@@ -17,6 +17,8 @@ Current tools:
 - Vanilla JS + Vite (no framework)
 - `pdf-lib` for PDF creation/merging/splitting
 - QR generator loaded locally from `public/vendor/qrcode.min.js`
+- OpenCV.js + jscanify (document edge detection / perspective correction),
+  vendored under `public/vendor/` and precached for offline use
 - Static deployment (Docker + nginx)
 
 ## Local development
@@ -73,8 +75,10 @@ This builds the static site and serves it with nginx on port 80.
 This repository includes third-party dependencies. Ensure you preserve upstream licenses when redistributing:
 - `pdf-lib` (MIT)
 - QR generator library (see the license included with your `qrcode.min.js` source)
+- OpenCV.js / OpenCV 4.7.0 (Apache-2.0) — vendored at `apps/web/public/vendor/opencv/opencv.js`
+- `jscanify` (MIT) — vendored at `apps/web/public/vendor/jscanify.js` (license: `apps/web/public/vendor/jscanify.LICENSE`)
 
-Add a `NOTICE` file if you want to explicitly list third-party licenses and attributions.
+See the [`NOTICE`](./NOTICE) file for the full third-party license list and attributions.
 
 ## Roadmap (planned)
 
