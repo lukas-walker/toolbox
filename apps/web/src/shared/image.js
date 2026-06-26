@@ -25,6 +25,51 @@ export async function loadImageElement(file) {
 }
 
 /**
+ * Re-encode a drawable image source to a JPEG Blob, optionally downscaling so
+ * its longest side is at most `maxDim`. The source can be anything CanvasRenderingContext2D
+ * accepts in drawImage (HTMLImageElement, HTMLCanvasElement, ImageBitmap, …),
+ * so both the Image-to-PDF tool (from a decoded <img>) and the document scanner
+ * (from a warped page <canvas>) share one compression pipeline.
+ *
+ * @param {CanvasImageSource & { naturalWidth?: number, naturalHeight?: number, width?: number, height?: number }} source
+ * @param {{ quality: number, maxDim?: number }} opts
+ * @returns {Promise<Blob>}
+ */
+export async function compressToJpegBlob(source, opts) {
+    const { quality, maxDim } = opts;
+
+    let w = source.naturalWidth || source.width;
+    let h = source.naturalHeight || source.height;
+
+    if (maxDim && Number.isFinite(maxDim) && maxDim > 0) {
+        const scale = Math.min(1, maxDim / Math.max(w, h));
+        w = Math.round(w * scale);
+        h = Math.round(h * scale);
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) throw new Error("Canvas not supported.");
+
+    ctx.drawImage(source, 0, 0, w, h);
+
+    const blob = await new Promise((resolve) => {
+        canvas.toBlob(
+            (b) => resolve(b),
+            "image/jpeg",
+            Math.min(1, Math.max(0.1, quality))
+        );
+    });
+
+    if (!blob) throw new Error("Failed to encode image.");
+
+    return blob;
+}
+
+/**
  * Re-encode an image file using canvas.
  * - If compress=false, returns original bytes.
  * - If compress=true, returns JPEG bytes at given quality (and optional max dimension).
@@ -41,34 +86,6 @@ export async function getImageBytesForPdf(file, opts) {
     }
 
     const img = await loadImageElement(file);
-
-    let w = img.naturalWidth || img.width;
-    let h = img.naturalHeight || img.height;
-
-    if (maxDim && Number.isFinite(maxDim) && maxDim > 0) {
-        const scale = Math.min(1, maxDim / Math.max(w, h));
-        w = Math.round(w * scale);
-        h = Math.round(h * scale);
-    }
-
-    const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = h;
-
-    const ctx = canvas.getContext("2d", { alpha: false });
-    if (!ctx) throw new Error("Canvas not supported.");
-
-    ctx.drawImage(img, 0, 0, w, h);
-
-    const blob = await new Promise((resolve) => {
-        canvas.toBlob(
-            (b) => resolve(b),
-            "image/jpeg",
-            Math.min(1, Math.max(0.1, quality))
-        );
-    });
-
-    if (!blob) throw new Error("Failed to encode image.");
-
+    const blob = await compressToJpegBlob(img, { quality, maxDim });
     return new Uint8Array(await blob.arrayBuffer());
 }

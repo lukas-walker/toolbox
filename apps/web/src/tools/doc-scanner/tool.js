@@ -1,4 +1,5 @@
 import { STATES, canTransition, quadOutputSize, fullFrameCorners } from "./logic.js";
+import { compressToJpegBlob } from "../../shared/image.js";
 
 // Live border detection (sub-issue #7) runs on a small downscaled copy of the
 // video frame for speed, and only a few times per second to keep CPU/battery in
@@ -11,6 +12,12 @@ const DETECT_INTERVAL_MS = 125; // ~8 fps throttle (not every animation frame)
 // Cap the longest side of a captured/warped page (sub-issue #8). Keeps documents
 // sharp without producing needlessly huge images to compress and embed in the PDF.
 const CAPTURE_MAX_SIDE = 2000;
+// Page compression (sub-issue #9). On Accept the warped page <canvas> is
+// re-encoded to a JPEG blob through the shared image pipeline so behavior matches
+// the Image-to-PDF tool. The page is already capped at CAPTURE_MAX_SIDE by the
+// warp, so we cap compression at the same longest side (no upscaling).
+const PAGE_JPEG_QUALITY = 0.8;
+const PAGE_MAX_DIM = CAPTURE_MAX_SIDE;
 
 // Same-origin, precached worker + vendored CV scripts (absolute so the worker's
 // importScripts resolves them regardless of base path). NEVER load from a CDN.
@@ -33,9 +40,16 @@ export function createDocScannerTool() {
     let panel = null;
     let state = STATES.IDLE;
 
-    // In-memory captured pages. Placeholder objects for now; later tasks store
-    // the compressed blob + object-URL thumbnail here. Capture order preserved.
+    // In-memory captured pages (sub-issue #9). Each is { id, blob, url } where
+    // `blob` is the compressed JPEG and `url` is its object-URL thumbnail. Nothing
+    // is persisted across reload. Capture order is preserved (no reordering in v1).
     let pages = [];
+
+    // When the user taps "Retake" on an existing page, we remove that page and
+    // remember its index here so the next accepted capture is inserted back in the
+    // same position (rather than appended), preserving page order. null for a
+    // normal capture/append.
+    let retakeIndex = null;
 
     // Camera (sub-issue #6). Single source of truth for the live stream + the
     // <video> it is attached to, so cleanup is reliable from anywhere. Later
@@ -647,11 +661,38 @@ export function createDocScannerTool() {
             viewport.innerHTML = `<div class="ds-viewport-placeholder muted">No preview available.</div>`;
         }
 
-        panel.querySelector("#ds-accept").addEventListener("click", () => {
-            // Hand the warped page (a canvas) off to the page list. Compression
-            // into a blob + thumbnail happens in sub-issue #9.
-            pages.push({ id: Date.now() + Math.random(), canvas: capturedCanvas });
+        const acceptBtn = panel.querySelector("#ds-accept");
+        acceptBtn.addEventListener("click", async () => {
+            const canvas = capturedCanvas;
+            if (!canvas) return;
+
+            // Compression is async (canvas.toBlob); guard against double taps and
+            // a Retake landing mid-encode.
+            const retakeBtn = panel.querySelector("#ds-retake");
+            acceptBtn.disabled = true;
+            acceptBtn.textContent = "Saving…";
+            if (retakeBtn) retakeBtn.disabled = true;
+
+            let blob;
+            try {
+                // Reuse the shared JPEG pipeline so behavior matches Image-to-PDF.
+                blob = await compressToJpegBlob(canvas, {
+                    quality: PAGE_JPEG_QUALITY,
+                    maxDim: PAGE_MAX_DIM,
+                });
+            } catch (err) {
+                console.error("doc-scanner: page compression failed", err);
+                if (acceptBtn.isConnected) { acceptBtn.disabled = false; acceptBtn.textContent = "Accept"; }
+                if (retakeBtn && retakeBtn.isConnected) retakeBtn.disabled = false;
+                return;
+            }
+
+            // The user may have torn down or moved on while we encoded; drop the
+            // result rather than mutating stale state (and don't leak a URL).
+            if (!root || state !== STATES.REVIEW || capturedCanvas !== canvas) return;
+
             capturedCanvas = null; // ownership transferred to the page
+            commitPage(blob);
             setState(STATES.PAGES);
         });
         panel.querySelector("#ds-retake").addEventListener("click", () => {
@@ -660,7 +701,40 @@ export function createDocScannerTool() {
         });
     }
 
+    // --- Page list management (sub-issue #9) ----------------------------------
+
+    // Store a freshly compressed page, with an object-URL thumbnail. Inserts at
+    // `retakeIndex` when replacing a retaken page, otherwise appends; either way
+    // capture order is preserved.
+    function commitPage(blob) {
+        const url = URL.createObjectURL(blob);
+        const page = { id: Date.now() + Math.random(), blob, url };
+        if (retakeIndex != null && retakeIndex >= 0 && retakeIndex <= pages.length) {
+            pages.splice(retakeIndex, 0, page);
+        } else {
+            pages.push(page);
+        }
+        retakeIndex = null;
+    }
+
+    // Revoke a single page's thumbnail object URL (idempotent).
+    function revokePage(page) {
+        if (page && page.url) {
+            try { URL.revokeObjectURL(page.url); } catch (e) { /* ignore */ }
+            page.url = null;
+        }
+    }
+
+    function revokeAllPages() {
+        pages.forEach(revokePage);
+    }
+
     function renderPages() {
+        // A normal entry into the page list is never mid-retake (commitPage clears
+        // retakeIndex before we get here); reset it so a backed-out retake can't
+        // misplace a later capture.
+        retakeIndex = null;
+
         const count = pages.length;
         panel.innerHTML = `
       <div class="panel">
@@ -684,13 +758,28 @@ export function createDocScannerTool() {
                 const item = document.createElement("div");
                 item.className = "ds-thumb";
                 item.innerHTML = `
-          <div class="ds-thumb-img muted">Page ${i + 1}</div>
-          <button class="mini" data-act="delete">Delete</button>
+          <img class="ds-thumb-img" alt="Page ${i + 1}" />
+          <div class="ds-thumb-label muted">Page ${i + 1}</div>
+          <div class="row ds-thumb-actions">
+            <button class="mini" data-act="retake">Retake</button>
+            <button class="mini" data-act="delete">Delete</button>
+          </div>
         `;
+                item.querySelector("img").src = page.url;
+
                 item.querySelector('[data-act="delete"]').addEventListener("click", () => {
-                    // Later tasks revoke this page's object URL before removing it.
+                    revokePage(page);
                     pages = pages.filter((p) => p !== page);
                     renderState();
+                });
+                item.querySelector('[data-act="retake"]').addEventListener("click", () => {
+                    // Remove the page, but remember where it was so the next capture
+                    // takes its place rather than landing at the end.
+                    const idx = pages.indexOf(page);
+                    revokePage(page);
+                    pages = pages.filter((p) => p !== page);
+                    retakeIndex = idx;
+                    setState(STATES.SCANNING);
                 });
                 thumbs.appendChild(item);
             });
@@ -729,15 +818,18 @@ export function createDocScannerTool() {
         panel = root.querySelector("#ds-panel");
         state = STATES.IDLE;
         pages = [];
+        retakeIndex = null;
         capturedCanvas = null;
         captureJob = null;
 
-        // Guarantee the detection loop, CV worker and camera are all released on
-        // unmount, regardless of which state we tear down from. Teardown unwinds
-        // in reverse, so the loop stops first, then the worker is terminated.
+        // Guarantee the detection loop, CV worker, camera and page thumbnail URLs
+        // are all released on unmount, regardless of which state we tear down from.
+        // Teardown unwinds in reverse, so the loop stops first, then the worker is
+        // terminated.
         registerTeardown(stopCamera);
         registerTeardown(terminateWorker);
         registerTeardown(stopDetection);
+        registerTeardown(revokeAllPages);
 
         renderState();
 
@@ -745,12 +837,13 @@ export function createDocScannerTool() {
     }
 
     function destroy() {
-        runTeardown();
+        runTeardown(); // revokes all page thumbnail URLs (revokeAllPages) too
         // Invalidate any in-flight warp and drop the captured page.
         captureToken++;
         captureJob = null;
         capturedCanvas = null;
         pages = [];
+        retakeIndex = null;
         state = STATES.IDLE;
         panel = null;
         if (root) root.innerHTML = "";
