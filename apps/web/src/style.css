@@ -182,3 +182,51 @@ button.mini {
     padding: 8px 10px;
     border-radius: 10px;
 }
+
+/* Document scanner */
+.ds-viewport {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 3 / 4;
+    max-height: 70vh;
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.ds-viewport-placeholder {
+    color: #cbd5e1;
+    text-align: center;
+    padding: 16px;
+}
+
+.ds-thumbs {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.ds-thumb {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    border: 1px solid var(--border);
+    background: #fff;
+    border-radius: 12px;
+    padding: 8px;
+}
+
+.ds-thumb-img {
+    aspect-ratio: 3 / 4;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--panel);
+    border-radius: 8px;
+    font-size: 12px;
+}
