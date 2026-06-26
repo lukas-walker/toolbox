@@ -12,10 +12,14 @@
  * Protocol (main thread -> worker):
  *   { type: "init", opencvUrl, jscanifyUrl }
  *   { type: "frame", frameId, width, height, buffer }   // buffer = RGBA ImageData, transferred
+ *   { type: "warp", jobId, width, height, buffer, corners, outWidth, outHeight }
+ *       // buffer = full-res RGBA ImageData (transferred); corners = full-res quad
  * Worker -> main thread:
  *   { type: "ready" }
  *   { type: "error", error }
  *   { type: "result", frameId, width, height, corners|null }
+ *   { type: "warpResult", jobId, ok, width, height, buffer }   // buffer = warped RGBA, transferred
+ *   { type: "warpResult", jobId, ok: false, error }
  */
 
 let cvReady = false;
@@ -33,6 +37,8 @@ self.onmessage = (e) => {
     } else if (msg.type === "frame") {
         pendingFrame = msg;
         processPending();
+    } else if (msg.type === "warp") {
+        warp(msg);
     }
 };
 
@@ -120,4 +126,58 @@ function processPending() {
     processing = false;
     // A newer frame may have arrived while we were busy.
     processPending();
+}
+
+// One-shot perspective warp of a captured full-resolution frame. The corner
+// quad (in full-res coords) and the desired output size are supplied by the
+// main thread; we just run getPerspectiveTransform + warpPerspective and post
+// the deskewed RGBA pixels back. All Mats are freed before returning.
+function warp(job) {
+    const { jobId, width, height, buffer, corners, outWidth, outHeight } = job;
+    if (!cvReady) {
+        self.postMessage({ type: "warpResult", jobId, ok: false, error: "cv not ready" });
+        return;
+    }
+    const cv = self.cv;
+    let src = null;
+    let srcTri = null;
+    let dstTri = null;
+    let M = null;
+    let dst = null;
+    try {
+        const imageData = new ImageData(new Uint8ClampedArray(buffer), width, height);
+        src = cv.matFromImageData(imageData);
+
+        const { topLeftCorner: tl, topRightCorner: tr, bottomRightCorner: br, bottomLeftCorner: bl } = corners;
+        // srcTri and dstTri share the same TL, TR, BL, BR ordering.
+        srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, bl.x, bl.y, br.x, br.y]);
+        dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, outWidth, 0, 0, outHeight, outWidth, outHeight]);
+
+        M = cv.getPerspectiveTransform(srcTri, dstTri);
+        dst = new cv.Mat();
+        cv.warpPerspective(
+            src,
+            dst,
+            M,
+            new cv.Size(outWidth, outHeight),
+            cv.INTER_LINEAR,
+            cv.BORDER_CONSTANT,
+            // White, opaque fill for any pixels mapped outside the source.
+            new cv.Scalar(255, 255, 255, 255)
+        );
+
+        // dst is CV_8UC4 (RGBA). Copy out of the WASM heap before freeing it.
+        const out = new Uint8ClampedArray(dst.data);
+        const outBuf = out.buffer;
+        self.postMessage(
+            { type: "warpResult", jobId, ok: true, width: outWidth, height: outHeight, buffer: outBuf },
+            [outBuf]
+        );
+    } catch (err) {
+        self.postMessage({ type: "warpResult", jobId, ok: false, error: (err && err.message) || String(err) });
+    } finally {
+        for (const m of [src, srcTri, dstTri, M, dst]) {
+            if (m) { try { m.delete(); } catch (e) { /* ignore */ } }
+        }
+    }
 }

@@ -1,8 +1,10 @@
 // Document scanner — pure, DOM-free logic.
 //
-// For this scaffold the only logic is the capture state machine. Later tasks
-// add the testable transforms here (perspective warp, compression, PDF build)
-// so they stay independent of the DOM, mirroring the other tools' logic.js.
+// The capture state machine plus the testable geometry for the perspective
+// warp (sub-issue #8) live here, independent of the DOM, mirroring the other
+// tools' logic.js. The raw OpenCV warp call itself runs in scanWorker.js (that
+// is where `cv` lives), but the decisions it needs — the output size and the
+// corner quad — are computed by the pure helpers below.
 
 /** The capture states the tool can be in. */
 export const STATES = Object.freeze({
@@ -47,4 +49,52 @@ export function canTransition(from, to) {
  */
 export function nextStates(from) {
     return (TRANSITIONS[from] || []).slice();
+}
+
+// --- Perspective warp geometry (sub-issue #8) --------------------------------
+
+/** @typedef {{ x: number, y: number }} Point */
+/** @typedef {{ topLeftCorner: Point, topRightCorner: Point, bottomRightCorner: Point, bottomLeftCorner: Point }} Quad */
+
+/**
+ * Output pixel size for a perspective-corrected document, given its detected
+ * corner quad. Preserves the corrected aspect ratio by taking the longer of
+ * each opposing edge pair, then caps the longest side to `maxSide` so the
+ * exported page never balloons past a reasonable resolution.
+ *
+ * Pure and DOM-free — unit-testable on its own.
+ * @param {Quad} corners
+ * @param {number} maxSide longest output side cap, in px
+ * @returns {{ width: number, height: number }}
+ */
+export function quadOutputSize(corners, maxSide) {
+    const { topLeftCorner: tl, topRightCorner: tr, bottomRightCorner: br, bottomLeftCorner: bl } = corners;
+    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+    let w = Math.max(dist(tl, tr), dist(bl, br));
+    let h = Math.max(dist(tl, bl), dist(tr, br));
+    w = Math.max(1, Math.round(w));
+    h = Math.max(1, Math.round(h));
+    if (Number.isFinite(maxSide) && maxSide > 0) {
+        const scale = Math.min(1, maxSide / Math.max(w, h));
+        w = Math.max(1, Math.round(w * scale));
+        h = Math.max(1, Math.round(h * scale));
+    }
+    return { width: w, height: h };
+}
+
+/**
+ * The four corners of the whole frame, in the canonical TL/TR/BR/BL shape the
+ * scanner uses everywhere. Serves as the fallback "quad" when no document was
+ * detected — warping it is effectively just a resize of the full frame.
+ * @param {number} width
+ * @param {number} height
+ * @returns {Quad}
+ */
+export function fullFrameCorners(width, height) {
+    return {
+        topLeftCorner: { x: 0, y: 0 },
+        topRightCorner: { x: width, y: 0 },
+        bottomRightCorner: { x: width, y: height },
+        bottomLeftCorner: { x: 0, y: height },
+    };
 }
