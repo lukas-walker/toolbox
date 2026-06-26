@@ -1,11 +1,22 @@
-import { STATES, canTransition } from "./logic.js";
-import { loadOpenCv, loadJscanify } from "../../shared/loadOpenCv.js";
+import { STATES, canTransition, quadOutputSize, fullFrameCorners } from "./logic.js";
 
 // Live border detection (sub-issue #7) runs on a small downscaled copy of the
 // video frame for speed, and only a few times per second to keep CPU/battery in
-// check on mid-range phones.
+// check on mid-range phones. The CV stack (OpenCV.js + jscanify) is run in a
+// dedicated Web Worker — see scanWorker.js — because OpenCV.js is a ~9 MB build
+// with the WASM embedded, and compiling/running it on the main thread freezes
+// the whole page. The worker keeps the UI responsive while it loads and detects.
 const DETECT_MAX_SIDE = 480; // longest side of the detection frame, in px
 const DETECT_INTERVAL_MS = 125; // ~8 fps throttle (not every animation frame)
+// Cap the longest side of a captured/warped page (sub-issue #8). Keeps documents
+// sharp without producing needlessly huge images to compress and embed in the PDF.
+const CAPTURE_MAX_SIDE = 2000;
+
+// Same-origin, precached worker + vendored CV scripts (absolute so the worker's
+// importScripts resolves them regardless of base path). NEVER load from a CDN.
+const WORKER_URL = `${import.meta.env.BASE_URL}scanWorker.js`;
+const OPENCV_URL = new URL(`${import.meta.env.BASE_URL}vendor/opencv/opencv.js`, location.href).href;
+const JSCANIFY_URL = new URL(`${import.meta.env.BASE_URL}vendor/jscanify.js`, location.href).href;
 
 // Scan Document — mobile-first, fully client-side document scanner.
 //
@@ -32,22 +43,36 @@ export function createDocScannerTool() {
     let currentStream = null;
     let videoEl = null;
 
-    // Live border detection (sub-issue #7). The CV stack is lazy-loaded on
-    // entering `scanning`; `cv` is the initialized OpenCV global and `scanner`
-    // a jscanify instance. The throttled loop draws each frame to a small
-    // offscreen canvas, finds the document quad, and paints it on `overlayEl`.
-    let cv = null;
-    let scanner = null;
-    let cvLoadToken = 0; // guards against a stale async load attaching late
+    // Live border detection (sub-issue #7). The CV stack runs in a Web Worker
+    // (scanWorker.js) so the heavy OpenCV load/detection never blocks the UI.
+    // The throttled loop downscales each frame and posts it to the worker; the
+    // worker posts back the document corners, which we paint on `overlayEl`.
+    let scanWorker = null;
+    let workerReady = false; // worker has loaded OpenCV + jscanify
+    let workerBusy = false; // a frame is currently being processed (one at a time)
     let overlayEl = null;
     let overlayCtx = null;
     let detectCanvas = null; // offscreen, downscaled frame for detection
-    let detectRaf = null; // requestAnimationFrame handle for the detect loop
+    let detectRaf = null; // requestAnimationFrame handle for the send loop
     let lastDetectAt = 0;
+    let frameSeq = 0;
+    // Dimensions of the frame currently in flight to the worker, so its result
+    // can be mapped back to display coordinates.
+    let inFlight = null;
     // Latest detected corners, in full-resolution (video-intrinsic) coordinates,
     // so the capture task (#8) can reuse them at full resolution. null when no
     // document is currently detected.
     let lastCorners = null;
+
+    // Capture + warp (sub-issue #8). On Capture we grab a full-resolution frame,
+    // reuse the latest live-detected corners, and hand both to the worker for a
+    // perspective warp. `capturedCanvas` holds the deskewed page awaiting
+    // Accept/Retake in the `review` state. `captureJob` carries the original
+    // frame as a fallback if the warp fails; `captureToken` invalidates stale
+    // async results (a retake or unmount that lands after the warp comes back).
+    let capturedCanvas = null;
+    let captureJob = null;
+    let captureToken = 0;
 
     // Teardown registry — later tasks push cleanup callbacks here.
     let teardownFns = [];
@@ -116,8 +141,7 @@ export function createDocScannerTool() {
         </div>
       </div>
     `;
-        // Placeholder capture: real frame grab + warp arrives in a later task.
-        panel.querySelector("#ds-capture").addEventListener("click", () => setState(STATES.REVIEW));
+        panel.querySelector("#ds-capture").addEventListener("click", onCaptureClick);
         panel.querySelector("#ds-back").addEventListener("click", () =>
             setState(pages.length ? STATES.PAGES : STATES.IDLE)
         );
@@ -208,8 +232,10 @@ export function createDocScannerTool() {
 
     // --- Live border detection (sub-issue #7) ---------------------------------
 
-    // Lazy-load the CV stack and start the throttled detection loop. Called once
-    // the camera feed is actually playing. Safe to call repeatedly.
+    // Spin up the CV worker (if needed) and start the throttled send loop once
+    // the camera feed is playing. Safe to call repeatedly. The heavy OpenCV load
+    // happens inside the worker, so the UI stays responsive (the page used to
+    // freeze when OpenCV.js was compiled on the main thread).
     function startDetection() {
         if (!panel || state !== STATES.SCANNING) return;
         overlayEl = panel.querySelector("#ds-overlay");
@@ -218,8 +244,8 @@ export function createDocScannerTool() {
 
         const statusEl = panel.querySelector("#ds-cv-status");
 
-        // Already loaded (e.g. re-entered scanning) — just (re)start the loop.
-        if (cv && scanner) {
+        // Worker already loaded (e.g. re-entered scanning) — just restart the loop.
+        if (workerReady && scanWorker) {
             if (statusEl) statusEl.hidden = true;
             startDetectLoop();
             return;
@@ -230,56 +256,74 @@ export function createDocScannerTool() {
             statusEl.textContent = "Loading scanner…";
         }
 
-        // Token guards against an async load resolving after we've left scanning.
-        const token = ++cvLoadToken;
-        // Load sequentially, NOT concurrently: loadOpenCv() must fully resolve
-        // before loadJscanify(). Calling both at once would run the loader's
-        // runtime-ready wait twice before init and only resolve one of them.
-        let readyCv = null;
-        loadOpenCv()
-            .then((c) => {
-                readyCv = c;
-                return loadJscanify();
-            })
-            .then((Jscanify) => {
-                if (token !== cvLoadToken || state !== STATES.SCANNING) return;
-                cv = readyCv;
-                scanner = new Jscanify();
-                const el = panel && panel.querySelector("#ds-cv-status");
-                if (el) el.hidden = true;
-                startDetectLoop();
-            })
-            .catch((err) => {
-                console.error("doc-scanner: failed to load CV stack", err);
-                if (token !== cvLoadToken) return;
-                const el = panel && panel.querySelector("#ds-cv-status");
-                // Detection is a non-blocking aid — capture still works without it.
-                if (el) {
-                    el.hidden = false;
-                    el.textContent = "Live border detection unavailable.";
-                }
-            });
+        if (!scanWorker) {
+            try {
+                scanWorker = new Worker(WORKER_URL);
+            } catch (err) {
+                console.error("doc-scanner: could not start CV worker", err);
+                showCvUnavailable();
+                return;
+            }
+            scanWorker.onmessage = onWorkerMessage;
+            scanWorker.onerror = (e) => {
+                console.error("doc-scanner: CV worker error", e && e.message);
+                showCvUnavailable();
+            };
+            scanWorker.postMessage({ type: "init", opencvUrl: OPENCV_URL, jscanifyUrl: JSCANIFY_URL });
+        }
+        // Otherwise the worker exists but is still loading; the "ready" message
+        // will start the loop.
+    }
+
+    function onWorkerMessage(e) {
+        const msg = e.data;
+        if (!msg) return;
+        if (msg.type === "ready") {
+            workerReady = true;
+            const el = panel && panel.querySelector("#ds-cv-status");
+            if (el) el.hidden = true;
+            if (state === STATES.SCANNING) startDetectLoop();
+        } else if (msg.type === "error") {
+            console.error("doc-scanner: CV worker:", msg.error);
+            showCvUnavailable();
+        } else if (msg.type === "result") {
+            workerBusy = false;
+            handleResult(msg);
+        } else if (msg.type === "warpResult") {
+            handleWarpResult(msg);
+        }
+    }
+
+    // Detection is a non-blocking aid — capture still works without it.
+    function showCvUnavailable() {
+        const el = panel && panel.querySelector("#ds-cv-status");
+        if (el) {
+            el.hidden = false;
+            el.textContent = "Live border detection unavailable.";
+        }
     }
 
     function startDetectLoop() {
         if (detectRaf != null) return; // already running
         lastDetectAt = 0;
-        detectRaf = requestAnimationFrame(detectTick);
+        detectRaf = requestAnimationFrame(sendTick);
     }
 
-    function detectTick(now) {
+    // Throttled loop: when the worker is idle, grab a downscaled frame and post
+    // it for detection. We never block the main thread on CV work here.
+    function sendTick(now) {
         // Schedule the next frame first so an exception can't kill the loop.
-        detectRaf = requestAnimationFrame(detectTick);
+        detectRaf = requestAnimationFrame(sendTick);
 
-        if (!cv || !scanner || !videoEl || state !== STATES.SCANNING) return;
-        // Throttle: only run a detection every DETECT_INTERVAL_MS.
+        if (!workerReady || !scanWorker || !videoEl || state !== STATES.SCANNING) return;
+        if (workerBusy) return; // worker still processing the previous frame
         if (now - lastDetectAt < DETECT_INTERVAL_MS) return;
-        lastDetectAt = now;
 
         const video = videoEl;
         const vw = video.videoWidth;
         const vh = video.videoHeight;
         if (video.readyState < 2 || !vw || !vh) return;
+        lastDetectAt = now;
 
         // Detect on a downscaled frame for speed (longest side ~DETECT_MAX_SIDE).
         const scale = Math.min(1, DETECT_MAX_SIDE / Math.max(vw, vh));
@@ -287,46 +331,166 @@ export function createDocScannerTool() {
         const dh = Math.max(1, Math.round(vh * scale));
         if (detectCanvas.width !== dw) detectCanvas.width = dw;
         if (detectCanvas.height !== dh) detectCanvas.height = dh;
-        const dctx = detectCanvas.getContext("2d");
+        const dctx = detectCanvas.getContext("2d", { willReadFrequently: true });
         dctx.drawImage(video, 0, 0, dw, dh);
 
-        let img = null;
-        let contour = null;
+        let imageData;
         try {
-            img = cv.imread(detectCanvas);
-            contour = scanner.findPaperContour(img);
-            const corners = contour ? scanner.getCornerPoints(contour) : null;
-            if (corners && hasAllCorners(corners)) {
-                // Map the downscaled corners back to full-resolution video coords
-                // so the capture task can reuse them; keep the latest set around.
-                const inv = 1 / scale;
-                lastCorners = {
-                    topLeftCorner: scalePoint(corners.topLeftCorner, inv),
-                    topRightCorner: scalePoint(corners.topRightCorner, inv),
-                    bottomRightCorner: scalePoint(corners.bottomRightCorner, inv),
-                    bottomLeftCorner: scalePoint(corners.bottomLeftCorner, inv),
-                };
-                drawOverlay(lastCorners, vw, vh);
-            } else {
-                // No document this frame — clear, don't crash.
-                lastCorners = null;
-                clearOverlay();
-            }
-        } catch (e) {
-            console.error("doc-scanner: detection error", e);
-        } finally {
-            // Free WASM-backed Mats every iteration to avoid memory growth.
-            if (contour) { try { contour.delete(); } catch (e) { /* ignore */ } }
-            if (img) { try { img.delete(); } catch (e) { /* ignore */ } }
+            imageData = dctx.getImageData(0, 0, dw, dh);
+        } catch (err) {
+            // e.g. a tainted canvas — shouldn't happen with the same-origin camera.
+            return;
         }
+
+        workerBusy = true;
+        inFlight = { vw, vh, dw, dh };
+        const buffer = imageData.data.buffer;
+        // Transfer the pixel buffer to avoid a copy.
+        scanWorker.postMessage(
+            { type: "frame", frameId: ++frameSeq, width: dw, height: dh, buffer },
+            [buffer]
+        );
     }
 
-    function hasAllCorners(c) {
-        return !!(c.topLeftCorner && c.topRightCorner && c.bottomRightCorner && c.bottomLeftCorner);
+    // Map a worker detection result onto the overlay.
+    function handleResult(msg) {
+        if (state !== STATES.SCANNING) return;
+        const sent = inFlight;
+        inFlight = null;
+        if (!sent || !overlayEl) return;
+
+        if (msg.corners) {
+            // Map the downscaled corners back to full-resolution video coords so
+            // the capture task can reuse them; keep the latest set around.
+            const inv = sent.vw / msg.width; // == 1 / scale
+            lastCorners = {
+                topLeftCorner: scalePoint(msg.corners.topLeftCorner, inv),
+                topRightCorner: scalePoint(msg.corners.topRightCorner, inv),
+                bottomRightCorner: scalePoint(msg.corners.bottomRightCorner, inv),
+                bottomLeftCorner: scalePoint(msg.corners.bottomLeftCorner, inv),
+            };
+            drawOverlay(lastCorners, sent.vw, sent.vh);
+        } else {
+            // No document this frame — clear, don't crash.
+            lastCorners = null;
+            clearOverlay();
+        }
     }
 
     function scalePoint(p, factor) {
         return { x: p.x * factor, y: p.y * factor };
+    }
+
+    // --- Capture + perspective warp (sub-issue #8) ----------------------------
+
+    // Grab the current frame at full camera resolution and warp it to a flat,
+    // cropped page. The heavy OpenCV warp runs in the worker (cv only lives
+    // there), so this stays async: we transition to `review` once the warped
+    // result comes back. If detection never found a document, or the CV worker
+    // is unavailable, we fall back to the full (unwarped) frame instead of
+    // failing.
+    function onCaptureClick() {
+        if (state !== STATES.SCANNING || !videoEl) return;
+        const video = videoEl;
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        if (video.readyState < 2 || !vw || !vh) return;
+
+        // Guard against a double press / navigation while the warp is in flight.
+        const captureBtn = panel && panel.querySelector("#ds-capture");
+        const backBtn = panel && panel.querySelector("#ds-back");
+        if (captureBtn) { captureBtn.disabled = true; captureBtn.textContent = "Processing…"; }
+        if (backBtn) backBtn.disabled = true;
+
+        // Full-resolution frame grab.
+        const frame = document.createElement("canvas");
+        frame.width = vw;
+        frame.height = vh;
+        const fctx = frame.getContext("2d", { willReadFrequently: true });
+        fctx.drawImage(video, 0, 0, vw, vh);
+
+        // Reuse the latest live-detected corners (already mapped to full-res). When
+        // none were found, fall back to the whole frame — warping that quad is just
+        // a resize, giving one uniform code path.
+        const corners = lastCorners || fullFrameCorners(vw, vh);
+
+        // Stop posting detection frames so the worker is free to warp promptly.
+        if (detectRaf != null) { cancelAnimationFrame(detectRaf); detectRaf = null; }
+
+        const token = ++captureToken;
+        captureJob = { token, frame };
+
+        // No CV worker (load failed) → cannot warp; use the plain resized frame.
+        if (!workerReady || !scanWorker) {
+            finishCapture(token, downscaledCanvas(frame, CAPTURE_MAX_SIDE));
+            return;
+        }
+
+        let imageData;
+        try {
+            imageData = fctx.getImageData(0, 0, vw, vh);
+        } catch (err) {
+            // Tainted canvas shouldn't happen with the same-origin camera, but if
+            // it does, degrade gracefully to the unwarped frame.
+            finishCapture(token, downscaledCanvas(frame, CAPTURE_MAX_SIDE));
+            return;
+        }
+
+        const { width: outW, height: outH } = quadOutputSize(corners, CAPTURE_MAX_SIDE);
+        const buffer = imageData.data.buffer;
+        scanWorker.postMessage(
+            {
+                type: "warp",
+                jobId: token,
+                width: vw,
+                height: vh,
+                buffer,
+                corners,
+                outWidth: outW,
+                outHeight: outH,
+            },
+            [buffer] // transfer the pixel buffer to avoid a copy
+        );
+    }
+
+    function handleWarpResult(msg) {
+        const job = captureJob;
+        // Ignore stale results (a newer capture, retake, or unmount happened).
+        if (!job || job.token !== msg.jobId) return;
+        captureJob = null;
+
+        if (msg.ok && msg.buffer && msg.width && msg.height) {
+            const canvas = document.createElement("canvas");
+            canvas.width = msg.width;
+            canvas.height = msg.height;
+            const imageData = new ImageData(new Uint8ClampedArray(msg.buffer), msg.width, msg.height);
+            canvas.getContext("2d").putImageData(imageData, 0, 0);
+            finishCapture(job.token, canvas);
+        } else {
+            // Warp failed in the worker — fall back to the unwarped frame.
+            console.error("doc-scanner: warp failed", msg.error);
+            finishCapture(job.token, downscaledCanvas(job.frame, CAPTURE_MAX_SIDE));
+        }
+    }
+
+    function finishCapture(token, canvas) {
+        // A newer capture or teardown landed while we were processing.
+        if (token !== captureToken || !root || state !== STATES.SCANNING) return;
+        capturedCanvas = canvas;
+        setState(STATES.REVIEW);
+    }
+
+    // Draw a source canvas onto a new one, scaled so its longest side is at most
+    // `maxSide`. Used for the no-warp fallbacks.
+    function downscaledCanvas(src, maxSide) {
+        const sw = src.width;
+        const sh = src.height;
+        const scale = Math.min(1, maxSide / Math.max(sw, sh));
+        const out = document.createElement("canvas");
+        out.width = Math.max(1, Math.round(sw * scale));
+        out.height = Math.max(1, Math.round(sh * scale));
+        out.getContext("2d").drawImage(src, 0, 0, out.width, out.height);
+        return out;
     }
 
     // Draw the detected quad onto the overlay, mapping video-intrinsic coords to
@@ -381,19 +545,29 @@ export function createDocScannerTool() {
         overlayCtx.clearRect(0, 0, overlayEl.clientWidth, overlayEl.clientHeight);
     }
 
-    // Stop the detection loop and release its DOM refs. CV Mats are freed each
-    // iteration, and the loaded `cv`/`scanner` are cached (idempotent loader) so
-    // re-entering scanning doesn't reload the WASM. Invalidate any in-flight load.
+    // Stop the send loop and release the overlay. The worker is kept alive (and
+    // reused) across scanning sessions so re-entering doesn't recompile the
+    // ~9 MB OpenCV WASM; it is terminated in destroy() via terminateWorker().
     function stopDetection() {
-        cvLoadToken++;
         if (detectRaf != null) {
             cancelAnimationFrame(detectRaf);
             detectRaf = null;
         }
+        workerBusy = false;
+        inFlight = null;
         clearOverlay();
         overlayEl = null;
         overlayCtx = null;
         lastCorners = null;
+    }
+
+    function terminateWorker() {
+        if (scanWorker) {
+            try { scanWorker.terminate(); } catch (e) { /* ignore */ }
+            scanWorker = null;
+        }
+        workerReady = false;
+        workerBusy = false;
     }
 
     // Map a getUserMedia rejection onto a clear, actionable message.
@@ -458,21 +632,32 @@ export function createDocScannerTool() {
     function renderReview() {
         panel.innerHTML = `
       <div class="panel">
-        <div class="ds-viewport">
-          <div class="ds-viewport-placeholder muted">Captured page preview (coming soon)</div>
-        </div>
+        <div class="ds-viewport" id="ds-review-viewport"></div>
         <div class="row">
           <button id="ds-accept" class="primary">Accept</button>
           <button id="ds-retake">Retake</button>
         </div>
       </div>
     `;
+        const viewport = panel.querySelector("#ds-review-viewport");
+        if (capturedCanvas) {
+            capturedCanvas.className = "ds-review-img";
+            viewport.appendChild(capturedCanvas);
+        } else {
+            viewport.innerHTML = `<div class="ds-viewport-placeholder muted">No preview available.</div>`;
+        }
+
         panel.querySelector("#ds-accept").addEventListener("click", () => {
-            // Placeholder page; later tasks store the warped+compressed image here.
-            pages.push({ id: Date.now() + Math.random() });
+            // Hand the warped page (a canvas) off to the page list. Compression
+            // into a blob + thumbnail happens in sub-issue #9.
+            pages.push({ id: Date.now() + Math.random(), canvas: capturedCanvas });
+            capturedCanvas = null; // ownership transferred to the page
             setState(STATES.PAGES);
         });
-        panel.querySelector("#ds-retake").addEventListener("click", () => setState(STATES.SCANNING));
+        panel.querySelector("#ds-retake").addEventListener("click", () => {
+            capturedCanvas = null; // discard; back to live scanning
+            setState(STATES.SCANNING);
+        });
     }
 
     function renderPages() {
@@ -544,11 +729,14 @@ export function createDocScannerTool() {
         panel = root.querySelector("#ds-panel");
         state = STATES.IDLE;
         pages = [];
+        capturedCanvas = null;
+        captureJob = null;
 
-        // Guarantee the detection loop and camera are released on unmount,
-        // regardless of which state we tear down from. Registered camera-first so
-        // it runs last (teardown unwinds in reverse), i.e. loop stops first.
+        // Guarantee the detection loop, CV worker and camera are all released on
+        // unmount, regardless of which state we tear down from. Teardown unwinds
+        // in reverse, so the loop stops first, then the worker is terminated.
         registerTeardown(stopCamera);
+        registerTeardown(terminateWorker);
         registerTeardown(stopDetection);
 
         renderState();
@@ -558,6 +746,10 @@ export function createDocScannerTool() {
 
     function destroy() {
         runTeardown();
+        // Invalidate any in-flight warp and drop the captured page.
+        captureToken++;
+        captureJob = null;
+        capturedCanvas = null;
         pages = [];
         state = STATES.IDLE;
         panel = null;

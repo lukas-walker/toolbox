@@ -9,7 +9,8 @@ export default defineConfig({
             includeAssets: [
                 "vendor/qrcode.min.js",
                 "vendor/opencv/opencv.js",
-                "vendor/jscanify.js"
+                "vendor/jscanify.js",
+                "scanWorker.js"
             ],
             workbox: {
                 // Cache the built app shell so it loads instantly and works offline.
