@@ -1,10 +1,13 @@
 // Document scanner — pure, DOM-free logic.
 //
 // The capture state machine plus the testable geometry for the perspective
-// warp (sub-issue #8) live here, independent of the DOM, mirroring the other
-// tools' logic.js. The raw OpenCV warp call itself runs in scanWorker.js (that
-// is where `cv` lives), but the decisions it needs — the output size and the
-// corner quad — are computed by the pure helpers below.
+// warp (sub-issue #8) and the PDF assembly (sub-issue #10) live here,
+// independent of the DOM, mirroring the other tools' logic.js. The raw OpenCV
+// warp call itself runs in scanWorker.js (that is where `cv` lives), but the
+// decisions it needs — the output size and the corner quad — are computed by
+// the pure helpers below.
+
+import { PDFDocument } from "pdf-lib";
 
 /** The capture states the tool can be in. */
 export const STATES = Object.freeze({
@@ -97,4 +100,46 @@ export function fullFrameCorners(width, height) {
         bottomRightCorner: { x: width, y: height },
         bottomLeftCorner: { x: 0, y: height },
     };
+}
+
+// --- PDF assembly (sub-issue #10) --------------------------------------------
+
+/**
+ * Build a single multi-page PDF from the captured pages, one image per page,
+ * each page sized to its image (mirrors image-to-pdf/logic.js). Pages are
+ * already JPEG-compressed by the capture pipeline (shared/image.js), so we can
+ * embed them directly with embedJpg — no re-encode here. Capture order is
+ * preserved.
+ *
+ * Kept DOM-free so it is unit-testable on its own.
+ * @param {Blob[]} pageBlobs JPEG blobs, in page order
+ * @returns {Promise<Blob>} the assembled PDF
+ */
+export async function buildScanPdf(pageBlobs) {
+    if (!pageBlobs?.length) throw new Error("No pages to export.");
+
+    const out = await PDFDocument.create();
+    for (const blob of pageBlobs) {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const img = await out.embedJpg(bytes);
+        const page = out.addPage([img.width, img.height]);
+        page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+    }
+
+    const outBytes = await out.save();
+    return new Blob([outBytes], { type: "application/pdf" });
+}
+
+/**
+ * A filesystem-safe timestamp for the exported file name, e.g.
+ * `20260626-184501`.
+ * @param {Date} [now]
+ * @returns {string}
+ */
+export function pdfTimestamp(now = new Date()) {
+    const p = (n) => String(n).padStart(2, "0");
+    return (
+        `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}` +
+        `-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`
+    );
 }

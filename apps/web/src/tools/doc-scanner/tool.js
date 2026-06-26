@@ -1,5 +1,6 @@
-import { STATES, canTransition, quadOutputSize, fullFrameCorners } from "./logic.js";
+import { STATES, canTransition, quadOutputSize, fullFrameCorners, buildScanPdf, pdfTimestamp } from "./logic.js";
 import { compressToJpegBlob } from "../../shared/image.js";
+import { downloadBlob } from "../../shared/download.js";
 
 // Live border detection (sub-issue #7) runs on a small downscaled copy of the
 // video frame for speed, and only a few times per second to keep CPU/battery in
@@ -786,11 +787,87 @@ export function createDocScannerTool() {
         }
 
         panel.querySelector("#ds-add").addEventListener("click", () => setState(STATES.SCANNING));
-        panel.querySelector("#ds-finish").addEventListener("click", () => {
-            // Placeholder export: PDF assembly + Web Share / download arrives later.
-            panel.querySelector("#ds-status").textContent =
-                "Export (PDF + share) is implemented in a later step.";
-        });
+        panel.querySelector("#ds-finish").addEventListener("click", exportPdf);
+    }
+
+    // --- PDF assembly + export (sub-issue #10) --------------------------------
+
+    // Build a single multi-page PDF from the captured pages, then hand it to the
+    // OS share sheet (mobile) or fall back to a download (desktop / browsers that
+    // can't share files). Async, so guard against navigation while it runs and
+    // re-query live DOM after each await (a delete/retake may have re-rendered).
+    let exporting = false;
+
+    async function exportPdf() {
+        if (exporting || !pages.length || state !== STATES.PAGES) return;
+        exporting = true;
+
+        const setStatus = (msg) => {
+            const el = panel && panel.querySelector("#ds-status");
+            if (el) el.textContent = msg;
+        };
+        const setExportDisabled = (disabled) => {
+            const finish = panel && panel.querySelector("#ds-finish");
+            const add = panel && panel.querySelector("#ds-add");
+            if (finish) finish.disabled = disabled || !pages.length;
+            if (add) add.disabled = disabled;
+        };
+
+        setExportDisabled(true);
+        setStatus("Building PDF…");
+
+        // Snapshot the page blobs now so a concurrent delete can't change the set
+        // mid-build. The blobs outlive a thumbnail-URL revoke, so this stays valid.
+        const blobs = pages.map((p) => p.blob);
+
+        let blob;
+        try {
+            blob = await buildScanPdf(blobs);
+        } catch (err) {
+            console.error("doc-scanner: PDF assembly failed", err);
+            setStatus("Could not build the PDF. Please try again.");
+            setExportDisabled(false);
+            exporting = false;
+            return;
+        }
+
+        // The user may have torn the tool down while the PDF was assembling.
+        if (!root || state !== STATES.PAGES) { exporting = false; return; }
+
+        const filename = `scan-${pdfTimestamp()}.pdf`;
+        const file = new File([blob], filename, { type: "application/pdf" });
+
+        // Prefer the native share sheet. File sharing needs a secure context and
+        // is unsupported on most desktop browsers — feature-detect and fall back
+        // to a plain download when it isn't available.
+        const canShareFiles =
+            typeof navigator !== "undefined" &&
+            typeof navigator.share === "function" &&
+            !!navigator.canShare?.({ files: [file] });
+
+        if (canShareFiles) {
+            try {
+                await navigator.share({ files: [file], title: "Scanned document", text: filename });
+                setStatus("Shared.");
+            } catch (err) {
+                // Dismissing the share sheet rejects with AbortError — that is a
+                // normal user action, not a failure, and must NOT also download.
+                if (err && err.name === "AbortError") {
+                    setStatus("");
+                } else {
+                    // A genuine share failure (e.g. target error) → download instead.
+                    console.error("doc-scanner: share failed, downloading instead", err);
+                    downloadBlob(blob, filename);
+                    setStatus("Downloaded.");
+                }
+            }
+        } else {
+            downloadBlob(blob, filename);
+            setStatus("Downloaded.");
+        }
+
+        setExportDisabled(false);
+        exporting = false;
     }
 
     function renderState() {
