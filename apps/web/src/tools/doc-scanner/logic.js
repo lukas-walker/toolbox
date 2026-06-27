@@ -107,12 +107,12 @@ export function fullFrameCorners(width, height) {
 /**
  * Build a single multi-page PDF from the captured pages, one image per page,
  * each page sized to its image (mirrors image-to-pdf/logic.js). Pages are
- * already JPEG-compressed by the capture pipeline (shared/image.js), so we can
- * embed them directly with embedJpg — no re-encode here. Capture order is
+ * lossless PNG blobs from the capture pipeline (shared/image.js), so we embed
+ * them directly with embedPng — no lossy re-encode here. Capture order is
  * preserved.
  *
  * Kept DOM-free so it is unit-testable on its own.
- * @param {Blob[]} pageBlobs JPEG blobs, in page order
+ * @param {Blob[]} pageBlobs PNG blobs, in page order
  * @returns {Promise<Blob>} the assembled PDF
  */
 export async function buildScanPdf(pageBlobs) {
@@ -121,7 +121,7 @@ export async function buildScanPdf(pageBlobs) {
     const out = await PDFDocument.create();
     for (const blob of pageBlobs) {
         const bytes = new Uint8Array(await blob.arrayBuffer());
-        const img = await out.embedJpg(bytes);
+        const img = await out.embedPng(bytes);
         const page = out.addPage([img.width, img.height]);
         page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
     }

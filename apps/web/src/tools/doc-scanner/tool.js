@@ -1,5 +1,5 @@
 import { STATES, canTransition, quadOutputSize, fullFrameCorners, buildScanPdf, pdfTimestamp } from "./logic.js";
-import { compressToJpegBlob } from "../../shared/image.js";
+import { canvasToPngBlob } from "../../shared/image.js";
 import { downloadBlob } from "../../shared/download.js";
 
 // Live border detection (sub-issue #7) runs on a small downscaled copy of the
@@ -13,12 +13,9 @@ const DETECT_INTERVAL_MS = 125; // ~8 fps throttle (not every animation frame)
 // Cap the longest side of a captured/warped page (sub-issue #8). Keeps documents
 // sharp without producing needlessly huge images to compress and embed in the PDF.
 const CAPTURE_MAX_SIDE = 2000;
-// Page compression (sub-issue #9). On Accept the warped page <canvas> is
-// re-encoded to a JPEG blob through the shared image pipeline so behavior matches
-// the Image-to-PDF tool. The page is already capped at CAPTURE_MAX_SIDE by the
-// warp, so we cap compression at the same longest side (no upscaling).
-const PAGE_JPEG_QUALITY = 0.8;
-const PAGE_MAX_DIM = CAPTURE_MAX_SIDE;
+// On Accept the warped page <canvas> is encoded to a lossless PNG blob — no
+// lossy re-compression, so scans keep their full quality. The page is already
+// capped at CAPTURE_MAX_SIDE by the warp, so no further downscaling is needed.
 
 // Same-origin, precached worker + vendored CV scripts (absolute so the worker's
 // importScripts resolves them regardless of base path). NEVER load from a CDN.
@@ -676,13 +673,10 @@ export function createDocScannerTool() {
 
             let blob;
             try {
-                // Reuse the shared JPEG pipeline so behavior matches Image-to-PDF.
-                blob = await compressToJpegBlob(canvas, {
-                    quality: PAGE_JPEG_QUALITY,
-                    maxDim: PAGE_MAX_DIM,
-                });
+                // Encode losslessly (PNG) so the scan keeps its full quality.
+                blob = await canvasToPngBlob(canvas);
             } catch (err) {
-                console.error("doc-scanner: page compression failed", err);
+                console.error("doc-scanner: page encoding failed", err);
                 if (acceptBtn.isConnected) { acceptBtn.disabled = false; acceptBtn.textContent = "Accept"; }
                 if (retakeBtn && retakeBtn.isConnected) retakeBtn.disabled = false;
                 return;

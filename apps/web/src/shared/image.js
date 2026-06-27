@@ -70,6 +70,24 @@ export async function compressToJpegBlob(source, opts) {
 }
 
 /**
+ * Encode a drawable canvas to a lossless PNG Blob, at full resolution (no
+ * downscaling, no quality loss). Used by the document scanner so captured pages
+ * keep their full quality instead of being re-compressed as JPEG.
+ *
+ * @param {HTMLCanvasElement} canvas
+ * @returns {Promise<Blob>}
+ */
+export async function canvasToPngBlob(canvas) {
+    const blob = await new Promise((resolve) => {
+        canvas.toBlob((b) => resolve(b), "image/png");
+    });
+
+    if (!blob) throw new Error("Failed to encode image.");
+
+    return blob;
+}
+
+/**
  * Re-encode an image file using canvas.
  * - If compress=false, returns original bytes.
  * - If compress=true, returns JPEG bytes at given quality (and optional max dimension).
